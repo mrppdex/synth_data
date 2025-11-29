@@ -1,0 +1,7 @@
+sdv
+pandas>=2.0.0
+streamlit
+torch
+plotly
+pyarrow
+pyreadstat
