@@ -10,7 +10,7 @@ class OneToOneMapper:
         self.mapping_dict = {}
         self.collapsed_columns = {}
 
-    def fit(self, df: pd.DataFrame):
+    def fit(self, df: pd.DataFrame, exclude_keys: list[str] = None, exclude_dependents: list[str] = None):
         """
         Automatically detect columns that have 1:1 or 1:N relationships.
         We look for columns B that are fully determined by column A (A -> B).
@@ -29,6 +29,9 @@ class OneToOneMapper:
            If A -> B, add B to "to_drop" and store mapping A -> B.
            If A <-> B, pick one as key.
         """
+        exclude_keys = exclude_keys if exclude_keys else []
+        exclude_dependents = exclude_dependents if exclude_dependents else []
+        
         # We only look at categorical/object/string columns for now, or low cardinality numerics
         # For performance on large datasets, we should be careful.
         # We'll use a heuristic: if nunique is relatively small compared to len(df), check.
@@ -44,13 +47,13 @@ class OneToOneMapper:
         processed = set()
         
         for i, col_a in enumerate(candidates):
-            if col_a in processed:
+            if col_a in processed or col_a in exclude_keys:
                 continue
                 
             # Find all columns determined by col_a
             determined_cols = []
             for col_b in candidates:
-                if col_a == col_b or col_b in processed:
+                if col_a == col_b or col_b in processed or col_b in exclude_dependents:
                     continue
                 
                 # Check if A -> B
@@ -179,7 +182,17 @@ class OneToOneMapper:
             for dep_col in dep_cols:
                 # Map values
                 # We cast key to string to match dictionary keys
-                df_copy[dep_col] = df_copy[key_col].astype(str).map(lambda x: mapping.get(x, {}).get(dep_col, None))
+                # Robustness: Handle float-as-string (e.g. "4.0" -> "4") if key was int
+                
+                def normalize_key(x):
+                    s = str(x)
+                    if s.endswith('.0'):
+                        return s[:-2]
+                    return s
+                
+                # Apply normalization to match fit-time keys (which were likely ints)
+                keys = df_copy[key_col].apply(normalize_key)
+                df_copy[dep_col] = keys.map(lambda x: mapping.get(x, {}).get(dep_col, None))
                 
         return df_copy
 
