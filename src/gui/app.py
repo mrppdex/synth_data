@@ -234,9 +234,75 @@ if uploaded_file:
         # Support multiple columns for sorting (e.g. Date + Seq)
         sequence_index = st.multiselect("Sequence Index (Time/Order Columns)", df.columns, placeholder="Select columns defining order (e.g., EXSTDT, EXSEQ)")
         
-        # Default entity columns to USUBJID if present
-        default_entities = [c for c in df.columns if 'USUBJID' in c]
-        entity_columns = st.multiselect("Entity Columns (Subject ID)", df.columns, default=default_entities)
+    # Entity Columns (Subject ID) - Needed for both if we use Reference Data
+    # For Subject-Level (Reference), it defines the ID to generate.
+    # For others, it defines the FK to Reference.
+    default_entities = [c for c in df.columns if 'USUBJID' in c]
+    entity_columns = st.multiselect("Entity Columns (Subject ID)", df.columns, default=default_entities)
+
+    # Reference Dataset Support
+    # Available for Longitudinal OR Subject-Level (if not the reference itself)
+    is_reference = False
+    if domain_type == "Subject-Level (e.g., DM)":
+        is_reference = st.checkbox("Is this a Reference Dataset (e.g., DM)?", value=True, help="Check this if you are training on the main subject-level dataset (e.g., DM). Uncheck if this is a supplementary subject-level dataset (e.g., SUPPDM) that depends on a reference.")
+        
+    # Show Reference Uploader if NOT a reference dataset
+    ref_file = None
+    ref_date_col = None
+    ref_df = None
+    
+    if not is_reference:
+        st.write("#### Reference Dataset (e.g., DM)")
+        ref_file = st.file_uploader("Upload Reference Dataset (optional)", type=['csv', 'sas7bdat'], key="ref_uploader")
+        
+        if ref_file:
+            try:
+                if ref_file.name.endswith('.sas7bdat'):
+                    ref_df, _ = pyreadstat.read_sas7bdat(ref_file)
+                else:
+                    ref_df = pd.read_csv(ref_file)
+                
+                st.success(f"Loaded Reference Data: {ref_df.shape}")
+                
+                # Select Reference Date Column
+                # Filter for date-like columns in ref_df
+                # We need to ensure types are detected or just show all
+                ref_date_col = st.selectbox("Reference Date Column (e.g., RFSTDTC)", ref_df.columns, index=None)
+                
+                if entity_columns:
+                    # Verify entity columns exist in ref_df
+                    missing_entities = [c for c in entity_columns if c not in ref_df.columns]
+                    if missing_entities:
+                        st.error(f"Entity columns {missing_entities} not found in Reference Dataset.")
+                        ref_df = None # Invalid
+                    else:
+                        # Persist for generation (Subject IDs)
+                        st.session_state['reference_dataframe'] = ref_df.copy()
+                        
+                        if ref_date_col:
+                            # Convert Ref Date to datetime
+                            try:
+                                ref_df[ref_date_col] = pd.to_datetime(ref_df[ref_date_col], errors='coerce')
+                                # Update persisted df with datetime conversion
+                                st.session_state['reference_dataframe'] = ref_df
+                            except Exception as e:
+                                st.warning(f"Could not convert {ref_date_col} to datetime: {e}")
+                else:
+                    # No entity columns selected yet, can't validate but persist anyway?
+                    # No, we need entity columns to link.
+                    pass
+                            
+            except Exception as e:
+                st.error(f"Error loading reference file: {e}")
+    else:
+        # Is Reference Dataset (e.g. DM)
+        # Allow selecting an INTERNAL Reference Date Column
+        st.write("#### Reference Date Configuration")
+        st.info("Select the main Reference Date column (e.g., RFSTDTC). Other date columns will be modeled as days relative to this date.")
+        # Filter for date columns in current df? Or just show all?
+        # We can try to guess or show all.
+        ref_date_col = st.selectbox("Reference Date Column (e.g., RFSTDTC)", df.columns, index=None)
+        # We don't need ref_df, we use df (processed_df later)
         
     # Constraints (Shared for both)
     st.subheader("Constraints")
@@ -290,6 +356,86 @@ if uploaded_file:
     protected_cols = list(set(protected_cols)) # Deduplicate
     
     # Run detection (exclude protected cols from being keys)
+    mapper.fit(processed_df, exclude_keys=protected_cols)
+    
+    # Reference Date Logic: Calculate DY and Drop DTC (Training Phase)
+    # This must happen BEFORE mapper.collapse? No, mapper detects 1:1.
+    # If we drop DTC, mapper won't see it.
+    # But DY should be 1:1 with DTC.
+    # If we replace DTC with DY, mapper should work on DY.
+    # So we should do this BEFORE mapper.fit?
+    # Yes, because we want to model DY, not DTC.
+    # And we want mapper to potentially collapse DY if it's redundant (though usually it's not).
+    # Wait, if we drop DTC, we don't need to worry about mapper collapsing DTC.
+    # But we need to ensure DY is created.
+    
+    # Let's move this logic BEFORE mapper.fit
+    dtc_to_dy_map = {} # Store for restoration: {dtc_col: dy_col}
+    
+    # Condition: Either External Ref Data (ref_df) OR Internal Ref Date (is_reference)
+    apply_ref_logic = False
+    if not is_reference and ref_df is not None and ref_date_col:
+        apply_ref_logic = True
+    elif is_reference and ref_date_col:
+        apply_ref_logic = True
+        
+    if apply_ref_logic:
+        st.info("Applying Reference Date Logic: Calculating DY and dropping DTC columns.")
+        
+        try:
+            # If External Ref Data, merge it first
+            if not is_reference and ref_df is not None:
+                # Create a subset of ref_df with unique subjects
+                ref_subset = ref_df[entity_columns + [ref_date_col]].drop_duplicates(subset=entity_columns)
+                # Merge
+                processed_df = pd.merge(processed_df, ref_subset, on=entity_columns, how='left')
+            
+            # Ensure Ref Date is datetime (for both cases)
+            # If internal, it might be string/object
+            processed_df[ref_date_col] = pd.to_datetime(processed_df[ref_date_col], errors='coerce')
+
+            # Find DTC columns
+            dtc_cols = [c for c in processed_df.columns if c.endswith('DTC') and c != ref_date_col]
+            
+            for dtc_col in dtc_cols:
+                # Determine DY column name
+                prefix = dtc_col[:-3] # Remove 'DTC'
+                dy_col = prefix + 'DY'
+                
+                # Calculate DY
+                # Ensure DTC is datetime
+                processed_df[dtc_col] = pd.to_datetime(processed_df[dtc_col], errors='coerce')
+                
+                # Calculate difference in days
+                days_diff = (processed_df[dtc_col] - processed_df[ref_date_col]).dt.days
+                
+                # Apply CDISC logic
+                dy_values = np.where(days_diff >= 0, days_diff + 1, days_diff)
+                
+                # Assign to DY column
+                processed_df[dy_col] = dy_values
+                
+                # Drop DTC column
+                processed_df = processed_df.drop(columns=[dtc_col])
+                
+                # Store map
+                dtc_to_dy_map[dtc_col] = dy_col
+                
+            # Drop Ref Date column?
+            # If External Ref Data: YES, drop it (we merged it just for calc).
+            # If Internal Ref Date (is_reference): NO, keep it (it's the anchor feature).
+            if not is_reference and ref_date_col in processed_df.columns:
+                 processed_df = processed_df.drop(columns=[ref_date_col])
+                 
+            st.success(f"Converted {len(dtc_cols)} DTC columns to DY. Dropped DTCs.")
+            st.session_state['dtc_to_dy_map'] = dtc_to_dy_map
+            st.session_state['ref_date_col_name'] = ref_date_col # Store name for later
+            
+        except Exception as e:
+            st.error(f"Error applying Reference Date logic: {e}")
+            
+    # Re-run detection (exclude protected cols from being keys)
+    # Note: processed_df now has DY instead of DTC.
     mapper.fit(processed_df, exclude_keys=protected_cols)
     
     # Interactive Preprocessing: Allow user to review/modify groups
@@ -486,7 +632,7 @@ if uploaded_file:
                     st.session_state['real_data'] = df
                     st.success("Model trained successfully!")
                 else:
-                    # Longitudinal Model
+                    # Longitudinal
                     # Initialize session state for training if not present
                     if 'is_training' not in st.session_state:
                         st.session_state['is_training'] = False
@@ -494,7 +640,7 @@ if uploaded_file:
                         st.session_state['loss_history'] = []
                     
                     # Start Training
-                    if not st.session_state['is_training']:
+                    if not st.session_state['is_training']: # Only initialize if not already training
                         st.write("Debug: explicit_int_cols passed to model:", explicit_int_cols)
                         model = LongitudinalSynthesizer(
                             sequence_index=sequence_index, 
@@ -508,14 +654,27 @@ if uploaded_file:
                         # Prepare (Preprocess, Init)
                         model.prepare_training(train_df)
                         
-                        st.session_state['model'] = model
-                        st.session_state['mapper'] = mapper
-                        st.session_state['missing_handler'] = missing_handler
-                        st.session_state['real_data'] = df
                         st.session_state['is_training'] = True
                         st.session_state['current_epoch'] = 0
                         st.session_state['loss_history'] = []
-                        st.rerun()
+                        # Store entity_columns for generation
+                        st.session_state['entity_columns'] = entity_columns
+                        st.session_state['sequence_index'] = sequence_index
+                        st.session_state['trained_domain_type'] = domain_type # Ensure it's set here too
+                        st.session_state['trained_is_reference'] = is_reference
+                        st.session_state['explicit_int_cols'] = explicit_int_cols
+                        st.session_state['original_columns'] = df.columns.tolist()
+                        
+                st.session_state['model'] = model
+                st.session_state['mapper'] = mapper
+                st.session_state['missing_handler'] = missing_handler
+                st.session_state['real_data'] = df
+                # Store entity_columns for generation if Subject-Level
+                if domain_type == "Subject-Level (e.g., DM)":
+                    st.session_state['entity_columns'] = entity_columns
+                    st.session_state['original_columns'] = df.columns.tolist()
+                st.success("Model trained successfully!")
+                st.rerun() # Rerun to update UI and potentially start longitudinal training loop
                         
     # Training Loop (Runs if is_training is True)
     if st.session_state.get('is_training'):
@@ -553,33 +712,250 @@ if uploaded_file:
         else:
             st.rerun()
 
-    # Generation
+    # Generation Section (New)
     if 'model' in st.session_state:
         st.divider()
-        st.header("Generate Synthetic Data")
-        n_samples = st.number_input("Number of samples", min_value=1, value=len(df))
+        st.header("Generation")
         
-        if st.button("Generate"):
-            model = st.session_state['model']
-            mapper = st.session_state['mapper']
-            missing_handler = st.session_state['missing_handler']
+        # Retrieve model from session state
+        model = st.session_state['model']
+        # Use persisted training state, fallback to current if missing (backwards compat)
+        is_reference_inferred = st.session_state.get('trained_is_reference', st.session_state.get('is_reference', False))
+        trained_domain_type = st.session_state.get('trained_domain_type', domain_type) 
+        
+        # Allow user to override if needed (e.g. if state was lost or they want to force behavior)
+        if trained_domain_type == "Subject-Level (e.g., DM)":
+            is_reference = st.checkbox("Generate as Reference Dataset (New Subject IDs)", value=is_reference_inferred, help="If checked, generates new Subject IDs. If unchecked, requires a Reference Dataset to match IDs.")
+        else:
+            is_reference = is_reference_inferred
+        
+        # Settings
+        n_samples = st.number_input("Number of Samples", min_value=1, value=100)
+        
+        synth_ref_df = None
+        # Check if we need Reference Data for generation
+        # Needed if:
+        # 1. dtc_to_dy_map exists (to restore dates)
+        # 2. It's a non-reference domain (Longitudinal OR Subject-Level non-ref) and we want to match IDs.
+        
+        # Let's generalize:
+        # If NOT is_reference (meaning it depends on a reference), we allow uploading Ref Data.
+        
+        # Determine if we should show Ref Data uploader
+        # We show it if dtc_to_dy_map is active OR if we are not a reference dataset (to match IDs).
+        # But for Longitudinal, we might just generate n_samples without Ref Data (new subjects).
+        # However, user asked for Ref Data integration.
+        
+        need_ref_data = False
+        if 'dtc_to_dy_map' in st.session_state and st.session_state['dtc_to_dy_map']:
+            # If is_reference, we DON'T need external ref data for dates (we use internal).
+            if not is_reference:
+                need_ref_data = True
+        if trained_domain_type == "Longitudinal (e.g., LB, AE)":
+            need_ref_data = True # Optional but recommended
+        if trained_domain_type == "Subject-Level (e.g., DM)" and not is_reference:
+            need_ref_data = True # Required to match IDs
             
-            synth_df = model.generate(n_samples)
+        if need_ref_data:
+            st.info("Reference Data Logic: Upload Synthetic Reference Data (e.g., generated DM) to match IDs or restore dates.")
             
-            # Restore
-            synth_df = mapper.restore(synth_df)
-            
-            if missing_handler:
-                synth_df = missing_handler.inverse_transform(synth_df)
-            
-            # Restore Constant Columns
-            if 'constant_values' in st.session_state:
-                for col, val in st.session_state['constant_values'].items():
-                    synth_df[col] = val
-            
-            st.session_state['synth_data'] = synth_df
-            st.success("Data generated!")
-            st.rerun()
+            # Check if we have a persisted reference dataframe (from training)
+            if 'reference_dataframe' in st.session_state:
+                st.success("Using uploaded Reference Dataset (from training step).")
+                synth_ref_df = st.session_state['reference_dataframe']
+                # Option to override?
+                if st.checkbox("Upload a different Reference Dataset?"):
+                    synth_ref_file = st.file_uploader("Synthetic Reference Data", type=['csv', 'sas7bdat'], key="synth_ref_uploader")
+                    if synth_ref_file:
+                        if synth_ref_file.name.endswith('.sas7bdat'):
+                            synth_ref_df, _ = pyreadstat.read_sas7bdat(synth_ref_file)
+                        else:
+                            synth_ref_df = pd.read_csv(synth_ref_file)
+                        st.success(f"Loaded New Ref Data: {synth_ref_df.shape}")
+            else:
+                # Fallback to uploader if not persisted
+                # Only warn if strictly required?
+                if trained_domain_type == "Subject-Level (e.g., DM)" and not is_reference:
+                     st.warning("Reference Dataset is required for this domain type to match Subject IDs.")
+                
+                synth_ref_file = st.file_uploader("Synthetic Reference Data", type=['csv', 'sas7bdat'], key="synth_ref_uploader")
+                
+                if synth_ref_file:
+                    if synth_ref_file.name.endswith('.sas7bdat'):
+                        synth_ref_df, _ = pyreadstat.read_sas7bdat(synth_ref_file)
+                    else:
+                        synth_ref_df = pd.read_csv(synth_ref_file)
+                    st.success(f"Loaded Synthetic Ref Data: {synth_ref_df.shape}")
+                
+        # Auto-generate logic
+        if 'synth_data' not in st.session_state:
+             # Block if required ref data is missing
+             if trained_domain_type == "Subject-Level (e.g., DM)" and not is_reference and synth_ref_df is None:
+                 st.warning("Waiting for Synthetic Reference Data to match Subject IDs...")
+             elif 'dtc_to_dy_map' in st.session_state and st.session_state['dtc_to_dy_map'] and not is_reference and synth_ref_df is None:
+                 # Only block if NOT is_reference (because if is_reference, we use internal dates)
+                 st.warning("Waiting for Reference Data to restore dates...")
+             else:
+                 with st.spinner("Generating synthetic data..."):
+                    if trained_domain_type == "Subject-Level (e.g., DM)":
+                        if not is_reference and synth_ref_df is not None:
+                            # Non-Reference Subject-Level (e.g. SUPPDM)
+                            # ... (existing logic)
+                            synth_df = model.generate(n_samples)
+                            
+                            # Overwrite IDs
+                            ent_cols = st.session_state.get('entity_columns', [])
+                            if ent_cols and ent_cols[0] in synth_df.columns and ent_cols[0] in synth_ref_df.columns:
+                                ref_ids = synth_ref_df[ent_cols[0]].unique()
+                                import numpy as np
+                                assigned_ids = np.random.choice(ref_ids, size=len(synth_df))
+                                synth_df[ent_cols[0]] = assigned_ids
+                                st.info(f"Assigned {len(ref_ids)} unique Subject IDs from Reference Data to {len(synth_df)} generated rows.")
+                        else:
+                            # Reference Subject-Level (DM) - Generate new IDs
+                            synth_df = model.generate(n_samples)
+                            
+                    else:
+                        # Longitudinal
+                        # ... (existing logic)
+                        if synth_ref_df is not None:
+                            synth_df = model.generate(n_samples)
+                            # Overwrite IDs
+                            ent_cols = st.session_state.get('entity_columns', [])
+                            if ent_cols and ent_cols[0] in synth_df.columns and ent_cols[0] in synth_ref_df.columns:
+                                ref_ids = synth_ref_df[ent_cols[0]].unique()
+                                gen_ids = synth_df[ent_cols[0]].unique()
+                                id_map = {}
+                                for i, gid in enumerate(gen_ids):
+                                    id_map[gid] = ref_ids[i % len(ref_ids)]
+                                synth_df[ent_cols[0]] = synth_df[ent_cols[0]].map(id_map)
+                        else: # Longitudinal, no ref_df provided
+                            synth_df = model.generate(n_samples)
+                        
+                    # Restore
+                    synth_df = mapper.restore(synth_df)
+                    
+                    if missing_handler:
+                        synth_df = missing_handler.inverse_transform(synth_df)
+                    
+                    # Restore Constant Columns
+                    if 'constant_values' in st.session_state:
+                        for col, val in st.session_state['constant_values'].items():
+                            synth_df[col] = val
+                            
+                    # Restore DTC from DY (Reference Date Logic)
+                    if 'dtc_to_dy_map' in st.session_state:
+                         dtc_map = st.session_state['dtc_to_dy_map']
+                         ref_date_col_name = st.session_state.get('ref_date_col_name')
+                         
+                         # Determine source of Ref Date
+                         # If is_reference: Internal column in synth_df
+                         # If not is_reference: External column in synth_ref_df
+                         
+                         source_df = None
+                         if is_reference:
+                             source_df = synth_df
+                         elif synth_ref_df is not None:
+                             # We need to merge ref date from synth_ref_df
+                             # Ensure entity columns match
+                             # We just mapped IDs, so they should match.
+                             
+                             # Merge
+                             try:
+                                 # Subset ref
+                                 ref_sub = synth_ref_df[model.entity_columns + [ref_date_col_name]].drop_duplicates(subset=model.entity_columns)
+                                 # We merge into synth_df temporarily to calculate
+                                 # But wait, if we merge, we might duplicate rows if not careful?
+                                 # No, left join on ID.
+                                 
+                                 # We need to be careful not to overwrite existing columns if names clash?
+                                 # ref_date_col_name shouldn't be in synth_df (we dropped it if it was external).
+                                 
+                                 # But if is_reference, it IS in synth_df.
+                                 
+                                 # So if NOT is_reference, merge.
+                                 source_df = pd.merge(synth_df, ref_sub, on=model.entity_columns, how='left')
+                             except Exception as e:
+                                 st.error(f"Error merging Reference Date: {e}")
+                                 source_df = None
+                         
+                         if source_df is not None and ref_date_col_name and ref_date_col_name in source_df.columns:
+                                 # Restore DTC
+                                 for dtc_col, dy_col in dtc_map.items():
+                                     if dy_col in synth_df.columns: # Check in synth_df (DY is there)
+                                         # Ensure RefDate is datetime
+                                         source_df[ref_date_col_name] = pd.to_datetime(source_df[ref_date_col_name], errors='coerce')
+                                         
+                                         # Logic
+                                         # Note: source_df might be synth_df (if is_reference) or merged df.
+                                         # If merged, we need to map back to synth_df rows.
+                                         # Actually, if we merged left, source_df has same index as synth_df.
+                                         
+                                         dy_vals = synth_df[dy_col].fillna(0).astype(int)
+                                         days_offset = np.where(dy_vals > 0, dy_vals - 1, dy_vals)
+                                         
+                                         mask = synth_df[dy_col].notna() & source_df[ref_date_col_name].notna()
+                                         
+                                         # Calculate DTC
+                                         dtc_series = source_df.loc[mask, ref_date_col_name] + pd.to_timedelta(days_offset[mask], unit='D')
+                                         
+                                         # Assign back to synth_df
+                                         synth_df.loc[mask, dtc_col] = dtc_series
+                                         synth_df[dtc_col] = pd.to_datetime(synth_df[dtc_col]).dt.strftime('%Y-%m-%d')
+                                         
+                                 st.success("Restored DTC columns from DY and Reference Date.")
+                         else:
+                             if not is_reference and synth_ref_df is None:
+                                 pass # We warned already
+                             elif ref_date_col_name:
+                                 st.warning(f"Reference Date column {ref_date_col_name} not found.")
+                                 
+                    # Post-Processing Cleanup
+                    # 1. Drop DY columns (intermediate)
+                    if 'dtc_to_dy_map' in st.session_state:
+                        dy_cols_to_drop = list(st.session_state['dtc_to_dy_map'].values())
+                        original_cols = st.session_state.get('original_columns', [])
+                        
+                        # Only drop if they exist AND were not in original data
+                        # If a DY col was in original data, we should keep it (it was modeled).
+                        # But wait, if we modeled it, it's in synth_df.
+                        # If we used it to restore DTC, we might have overwritten it?
+                        # No, we used it to calculate DTC.
+                        
+                        cols_to_remove = []
+                        for col in dy_cols_to_drop:
+                            if col in synth_df.columns:
+                                if col not in original_cols:
+                                    cols_to_remove.append(col)
+                                else:
+                                    # It was in original data, so we keep it.
+                                    pass
+                                    
+                        if cols_to_remove:
+                            synth_df = synth_df.drop(columns=cols_to_remove)
+                            st.info(f"Dropped intermediate DY columns: {cols_to_remove}")
+                            
+                    # 2. Enforce Integer Types
+                    # Use persisted explicit_int_cols
+                    explicit_int_cols = st.session_state.get('explicit_int_cols', [])
+                    if explicit_int_cols:
+                        converted_count = 0
+                        for col in explicit_int_cols:
+                            if col in synth_df.columns:
+                                try:
+                                    # Convert to numeric first to handle strings "1.0"
+                                    synth_df[col] = pd.to_numeric(synth_df[col], errors='coerce')
+                                    # Cast to Int64 (nullable integer)
+                                    synth_df[col] = synth_df[col].astype('Int64')
+                                    converted_count += 1
+                                except Exception as e:
+                                    st.warning(f"Could not cast {col} to Integer: {e}")
+                        if converted_count > 0:
+                            st.info(f"Enforced Integer type for {converted_count} columns.")
+                    
+                    st.session_state['synth_data'] = synth_df
+                    st.success("Data generated!")
+                    st.rerun()
 
     # Evaluation
     if 'model' in st.session_state:
