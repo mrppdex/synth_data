@@ -13,18 +13,39 @@ class AnchorGenerator:
         days = random.randint(0, range_days)
         return start_date + timedelta(days=days)
 
-    def generate_anchors(self, n_subjects=10):
+    def generate_anchors(self, config=None):
+        if config is None:
+            config = {
+                "n_subjects": 10,
+                "age_range": (18, 75),
+                "gender_ratio": {"M": 0.5, "F": 0.5}, # Approximate probability
+                "arms": ["Placebo", "Xanomeline High Dose", "Xanomeline Low Dose"],
+                "start_date": "2023-01-01"
+            }
+        
         anchors = []
-        base_date = datetime(2023, 1, 1)
+        base_date = datetime.strptime(config.get("start_date", "2023-01-01"), "%Y-%m-%d")
+        arms = config.get("arms", ["Placebo"])
+        n_subjects = config.get("n_subjects", 10)
+        age_min, age_max = config.get("age_range", (18, 75))
+        
+        # Gender logic
+        gender_probs = config.get("gender_ratio", {"M": 0.5, "F": 0.5})
+        genders = list(gender_probs.keys())
+        weights = list(gender_probs.values())
 
         for i in range(1, n_subjects + 1):
             usubjid = f"01-701-{1000+i}"
-            arm = random.choice(self.arms)
+            arm = random.choice(arms)
+            
+            # Demographics
+            age = random.randint(age_min, age_max)
+            sex = random.choices(genders, weights=weights, k=1)[0]
             
             # Logic: RFSTDTC <= TRTSDT <= TRTEDT
             
             # 1. Informed Consent / Reference Start (RFSTDTC)
-            # Randomly within Jan-Mar 2023
+            # Randomly within Jan-Mar of start year
             rfstdtc_dt = self.generate_date(base_date, 90)
             
             # 2. Treatment Start (TRTSDT)
@@ -33,14 +54,14 @@ class AnchorGenerator:
             
             # 3. Treatment End (TRTEDT)
             # Must be >= TRTSDT. Let's say treatment duration is 30-180 days.
-            trtedt_dt = self.generate_date(trtsdt_dt, 150) # 30 + (0 to 150) = 30-180 days?? No, generate_date adds 0-range.
-            # Fix: Ensure at least some duration? 
-            # Let's force at least 1 day duration.
-            trtedt_dt = trtsdt_dt + timedelta(days=random.randint(1, 180))
+            duration = random.randint(30, 180)
+            trtedt_dt = trtsdt_dt + timedelta(days=duration)
 
             anchor = {
                 "USUBJID": usubjid,
                 "ARM": arm,
+                "AGE": age,
+                "SEX": sex,
                 "RFSTDTC": rfstdtc_dt.strftime("%Y-%m-%d"),
                 "TRTSDT": trtsdt_dt.strftime("%Y-%m-%d"),
                 "TRTEDT": trtedt_dt.strftime("%Y-%m-%d")

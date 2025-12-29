@@ -37,12 +37,56 @@ def render_data_studio():
                     st.error("Failed to parse spec.")
 
     with tab2:
-        st.subheader("Subject Anchors")
-        st.markdown("Load pre-generated or upload anchor data (CSV/JSON).")
+        st.subheader("Population Architect")
+        st.markdown("Design your synthetic cohort demographics.")
         
-        # Load existing anchors if available
-        if os.path.exists("output/anchors.json"):
-            st.info("Found existing anchors.json")
-            if st.button("Load Anchors"):
-                anchors = pd.read_json("output/anchors.json")
-                st.dataframe(anchors)
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.markdown("#### ⚙️ Configuration")
+            n_subjects = st.slider("Number of Subjects", 10, 1000, 50)
+            age_range = st.slider("Age Range", 0, 100, (18, 65))
+            
+            st.markdown("Start Date")
+            start_date = st.date_input("Study Reference Date", value=pd.to_datetime("2023-01-01"))
+            
+            st.markdown("Study Arms")
+            # Tag input simulation
+            default_arms = "Placebo, Active Low, Active High"
+            arms_input = st.text_area("Arms (comma separated)", value=default_arms)
+            arms_list = [a.strip() for a in arms_input.split(",") if a.strip()]
+
+        with col2:
+            st.markdown("#### 📊 Demographics Preview")
+            gender_balance = st.slider("Gender Balance (% Female)", 0, 100, 50)
+            
+            # Preview generation logic
+            if st.button("Generate Anchors"):
+                from anchor_generator import AnchorGenerator
+                gen = AnchorGenerator()
+                
+                config = {
+                    "n_subjects": n_subjects,
+                    "age_range": age_range,
+                    "gender_ratio": {"F": gender_balance/100, "M": 1 - (gender_balance/100)},
+                    "arms": arms_list,
+                    "start_date": str(start_date)
+                }
+                
+                anchors = gen.generate_anchors(config)
+                
+                # Save
+                gen.save_anchors(anchors)
+                st.success(f"Generated {len(anchors)} subjects!")
+                
+                # Visualization
+                df_anchors = pd.DataFrame(anchors)
+                
+                st.markdown("##### Age Distribution")
+                st.bar_chart(df_anchors['AGE'].value_counts())
+                
+                st.markdown("##### Arm Allocation")
+                st.bar_chart(df_anchors['ARM'].value_counts())
+                
+                with st.expander("View Raw Data"):
+                    st.dataframe(df_anchors)
