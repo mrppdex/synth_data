@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 import json
 import logging
 import re
@@ -7,8 +7,8 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-class T5GemmaGenerator:
-    def __init__(self, model_id="google/t5gemma-2-270m", device="auto", load_in_4bit=True):
+class QwenGenerator:
+    def __init__(self, model_id="Qwen/Qwen2.5-3B-Instruct", device="auto", load_in_4bit=True):
         self.model_id = model_id
         self.device = device
         
@@ -26,9 +26,8 @@ class T5GemmaGenerator:
         try:
             self._load_model(model_id, load_in_4bit)
         except OSError:
-            logger.warning(f"Model {model_id} not found. Falling back to 'google/flan-t5-base'.")
-            self.model_id = "google/flan-t5-base"
-            self._load_model(self.model_id, load_in_4bit)
+            logger.warning(f"Model {model_id} not found. Falling back to basic CPU loading or check network.")
+            raise
 
     def _load_model(self, model_id, load_in_4bit):
         logger.info(f"Loading model {model_id} on {self.device} (4-bit: {load_in_4bit})...")
@@ -40,23 +39,27 @@ class T5GemmaGenerator:
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16
             )
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            self.model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 quantization_config=quantization_config,
                 device_map="auto"
             )
         else:
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
+            self.model = AutoModelForCausalLM.from_pretrained(model_id)
             if self.device != "auto":
                 self.model.to(self.device)
 
-    def construct_prompt(self, anchor, spec, row_instruction=""):
-        # Matches Prompt Schema in Implemention Plan
-        prompt = f"""[SYSTEM]
-Role: CDISC ADaM Synthetic Data Generator
-Constraint: Output must be valid JSON matching the Specification variables.
+    def construct_messages(self, anchor, spec, row_instruction=""):
+        """
+        Constructs a list of messages for the chat template.
+        """
+        system_content = (
+            "Role: CDISC ADaM Synthetic Data Generator\n"
+            "Constraint: Output must be valid JSON matching the Specification variables.\n"
+            "Do not output markdown code blocks. Output ONLY the raw JSON object."
+        )
 
-[EXAMPLE]
+        user_content = f"""[EXAMPLE]
 Context: {{ "dataset": "ADAE", "variables": {{ "USUBJID": "...", ... }} }}
 Anchor: {{ "USUBJID": "01-1001" }}
 Output: {{ "USUBJID": "01-1001", "ASTDT": "2023-01-01", "AESEV": "MILD", "AETERM": "Headache", "AEDECOD": "Headache" }}
@@ -72,12 +75,20 @@ Output: {{ "USUBJID": "01-1001", "ASTDT": "2023-01-01", "AESEV": "MILD", "AETERM
 Dataset: {spec.get('dataset', 'UNKNOWN')}
 Generate one row of data for this subject as JSON.
 """
-        return prompt
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content}
+        ]
 
-    def generate_row(self, prompt, max_retries=3):
-        inputs = self.tokenizer(prompt, return_tensors="pt",  max_length=4096, truncation=True)
-        if self.device != "auto" and hasattr(self.model, "device"):
-            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+    def generate_row(self, messages, max_retries=3):
+        # Apply chat template
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
 
         for _ in range(max_retries):
             outputs = self.model.generate(
@@ -85,9 +96,14 @@ Generate one row of data for this subject as JSON.
                 max_new_tokens=512,
                 temperature=0.7,
                 do_sample=True,
+                pad_token_id=self.tokenizer.pad_token_id
             )
             
-            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Decode only the new tokens (removing input prompt)
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, outputs)
+            ]
+            decoded = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
             
             # Attempt to Parse JSON
             try:
@@ -102,7 +118,6 @@ Generate one row of data for this subject as JSON.
                 logger.warning(f"JSON decode error: {decoded}")
                 continue
                 
-        # If all retries fail, return empty or raw string
         return None
 
     def generate_dataset(self, anchors, spec, output_path):
@@ -112,15 +127,13 @@ Generate one row of data for this subject as JSON.
         logger.info(f"Generating {dataset_name} for {len(anchors)} subjects...")
         
         for anchor in tqdm(anchors):
-            # Custom instruction based on dataset type?
-            # For now generic.
-            prompt = self.construct_prompt(
+            messages = self.construct_messages(
                 anchor, 
                 spec, 
                 row_instruction=f"Generate {dataset_name} row. Ensure consistency with Anchor dates."
             )
             
-            row_data = self.generate_row(prompt)
+            row_data = self.generate_row(messages)
             if row_data:
                 # Merge Anchor keys if missing (USUBJID usually required)
                 if "USUBJID" not in row_data:
@@ -134,8 +147,8 @@ if __name__ == "__main__":
     # Test
     # Load dummy spec and anchors
     try:
-        with open("output/anchors.json") as f:
-            anchors = json.load(f)
+        # Create dummy anchors for testing if file doesn't exist
+        dummy_anchors = [{"USUBJID": "01-1001", "TRTSDT": "2024-01-01"}]
         
         # Manually create a minimal context if spec_parser not run or to test
         spec = {
@@ -147,8 +160,8 @@ if __name__ == "__main__":
             }
         }
         
-        gen = T5GemmaGenerator(load_in_4bit=False) # Force off for test script stability
-        rows = gen.generate_dataset(anchors[:1], spec, "output/test.json")
+        gen = QwenGenerator(load_in_4bit=False) 
+        rows = gen.generate_dataset(dummy_anchors, spec, "output/test.json")
         print(json.dumps(rows, indent=2))
         
     except Exception as e:
