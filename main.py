@@ -4,7 +4,7 @@ import json
 import pandas as pd
 from spec_parser import SpecParser
 from anchor_generator import AnchorGenerator
-from generator import T5GemmaGenerator
+from generator import QwenGenerator
 from validator import Validator
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,7 +40,7 @@ def main():
 
     # 3. Initialize Generator
     # Note: On Mac, load_in_4bit will likely be disabled by the class itself
-    generator = T5GemmaGenerator(model_id="google/t5gemma-2-270m", load_in_4bit=True)
+    generator = QwenGenerator(model_id="Qwen/Qwen2.5-3B-Instruct", load_in_4bit=True)
 
     # 4. Sequential Generation
     # Order: ADSL -> Others (simplified, usually BDS depends on ADSL, OCCDS on ADSL)
