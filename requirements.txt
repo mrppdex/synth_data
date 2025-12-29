@@ -5,4 +5,5 @@ torch
 bitsandbytes
 accelerate
 sentencepiece
-
+streamlit
+watchdog
